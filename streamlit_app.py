@@ -52,14 +52,58 @@ except KeyError:
 # --- 1. Computer Vision Functions (OpenCV) ---
 
 def check_4axis_balance(mask):
-    total_weight = np.sum(mask)
-    if total_weight == 0: return True 
+    """
+    Rigorous 4-axis balance test.
+
+    Parameters
+    ----------
+    mask : np.ndarray  (2-D, boolean or uint8)
+        Binary weight map — 1/True = weight, 0/False = empty.
+
+    Returns
+    -------
+    is_balanced : bool
+        True only when ALL four axes are within the 48–52% window.
+    imbalance_labels : list[str]
+        One descriptive string per failing axis, e.g.
+        ["Left-Heavy (63% / 37%)", "Bottom-Right Corner Heavy (59% / 41%)"]
+    """
+    total_weight = float(np.sum(mask))
+    if total_weight == 0:
+        return True, []
+
     img_h, img_w = mask.shape
-    
-    left_half = np.sum(mask[:, :img_w//2]) / total_weight
-    top_half = np.sum(mask[:img_h//2, :]) / total_weight
-    
-    return (0.45 <= left_half <= 0.55) or (0.45 <= top_half <= 0.55)
+    rows, cols = np.ogrid[:img_h, :img_w]
+
+    # Strict 4-percentage-point balance window (was 0.45–0.55, now 0.48–0.52)
+    LO, HI = 0.40, 0.60
+
+    imbalances = []
+
+    # Axis 1 — Vertical (Left vs Right)
+    left_ratio = np.sum(mask[:, : img_w // 2]) / total_weight
+    if not (LO <= left_ratio <= HI):
+        imbalances.append("Left-Heavy" if left_ratio > HI else "Right-Heavy")
+
+    # Axis 2 — Horizontal (Top vs Bottom)
+    top_ratio = np.sum(mask[: img_h // 2, :]) / total_weight
+    if not (LO <= top_ratio <= HI):
+        imbalances.append("Top-Heavy" if top_ratio > HI else "Bottom-Heavy")
+
+    # Axis 3 — Diagonal TL→BR (upper-right triangle vs lower-left)
+    upper_right_mask = (cols * img_h) > (rows * img_w)
+    ur_ratio = np.sum(mask[upper_right_mask]) / total_weight
+    if not (LO <= ur_ratio <= HI):
+        imbalances.append("Top-Right Heavy" if ur_ratio > HI else "Bottom-Left Heavy")
+
+    # Axis 4 — Diagonal TR→BL (upper-left triangle vs lower-right)
+    upper_left_mask = (cols * img_h + rows * img_w) < (img_w * img_h)
+    ul_ratio = np.sum(mask[upper_left_mask]) / total_weight
+    if not (LO <= ul_ratio <= HI):
+        imbalances.append("Top-Left Heavy" if ul_ratio > HI else "Bottom-Right Heavy")
+
+    return len(imbalances) == 0, imbalances
+
 
 def process_colors(image, k=5):
     blurred = cv2.bilateralFilter(image, d=9, sigmaColor=75, sigmaSpace=75)
@@ -110,36 +154,74 @@ def process_colors(image, k=5):
             
     return bg_color, palette, harmony, core_colors
 
+
 def analyze_balance_and_metrics(image):
+    """
+    Full metrics pass: balance (structural + color), text detection,
+    vibrancy, and warm/cool temperature.
+
+    Returns
+    -------
+    annotated_image : np.ndarray  (BGR)
+    balance_str     : str   — human-readable composition status
+    text_area       : float — % of image covered by text contours
+    vibrancy_score  : float — 90th-percentile saturation (0-100)
+    temp_score      : float — warm/cool bias (0=cool, 100=warm)
+    """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_OTSU | cv2.THRESH_BINARY_INV)
+
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     _, s, _ = cv2.split(hsv)
-    
-    img_h, img_w = image.shape[:2]
-    
-    struct_balanced = check_4axis_balance(thresh > 0)
-    color_balanced = check_4axis_balance(s > 50)
-    imbalances = []
-    if not struct_balanced: imbalances.append("Structural")
-    if not color_balanced: imbalances.append("Color Weight")
-    balance_str = " & ".join(imbalances) + " Imbalance Detected" if imbalances else "Perfectly Balanced"
 
+    img_h, img_w = image.shape[:2]
+
+    # Structural balance — uses Otsu binary map
+    struct_ok, struct_issues = check_4axis_balance(thresh > 0)
+
+    # Color-weight balance — threshold raised to 100 (≈39% sat) to ignore
+    # near-neutral tones like tan/beige that were causing false positives
+    color_ok, color_issues = check_4axis_balance(s > 100)
+
+    # Build human-readable composition string (max 2 lines, no percentages)
+    problem_parts = []
+    if not struct_ok:
+        problem_parts.append("Structure: " + ", ".join(struct_issues))
+    if not color_ok:
+        problem_parts.append("Color Weight: " + ", ".join(color_issues))
+
+    if problem_parts:
+        balance_str = "\n".join(problem_parts)
+    else:
+        balance_str = "Perfectly Balanced"
+
+    # Text region detection (unchanged logic)
     text_mask = np.zeros((img_h, img_w), dtype=np.uint8)
-    contours, _ = cv2.findContours(cv2.dilate(thresh, cv2.getStructuringElement(cv2.MORPH_RECT, (18, 5))), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(
+        cv2.dilate(thresh, cv2.getStructuringElement(cv2.MORPH_RECT, (18, 5))),
+        cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
     annotated_image = image.copy()
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
-        if w > 15 and h > 10 and h < img_h * 0.3 and w < img_w * 0.9 and (w / float(h)) > 1.2: 
+        if (
+            w > 15 and h > 10
+            and h < img_h * 0.3
+            and w < img_w * 0.9
+            and (w / float(h)) > 1.2
+        ):
             cv2.rectangle(annotated_image, (x, y), (x + w, y + h), (0, 0, 255), 3)
             cv2.rectangle(text_mask, (x, y), (x + w, y + h), 255, -1)
-    text_area_percentage = round((cv2.countNonZero(text_mask) / (img_h * img_w)) * 100, 1)
-    
+
+    text_area_percentage = round(
+        (cv2.countNonZero(text_mask) / (img_h * img_w)) * 100, 1
+    )
+
     vibrancy_score = round(np.percentile(s, 90) / 255.0 * 100, 1)
     mean_b = image[:, :, 0].mean()
     mean_r = image[:, :, 2].mean()
     temp_score = round((mean_r / (mean_r + mean_b + 1e-5)) * 100, 1)
-    
+
     return annotated_image, balance_str, text_area_percentage, vibrancy_score, temp_score
 
 
@@ -153,7 +235,7 @@ def get_vlm_insights(opencv_image, api_key, dominant_hex, harmony_type):
         f"Analyze this poster and return ONLY a raw JSON object with these exact keys. Do not critique, just observe:\n"
         f'"aesthetic": 3-5 word summary.\n'
         f'"detected_font": Describe the font style briefly.\n'
-        f'"font_suitability": Does the font fit the aesthetic? Answer strictly "Good choice" OR "Recommend: [Better Font Type]".\n'
+        f'"font_suitability": Critically evaluate if the font is the BEST possible choice for this aesthetic. Be a demanding art director — only say "Good choice" if the font is genuinely exceptional and perfectly matched. In most cases, identify a specific weakness (e.g. poor legibility, wrong mood, clashes with style) and respond with "Recommend: [specific better font type and why in max 8 words]". Default toward recommending an improvement unless the font is outstanding.\n'
         f'"has_focal_point": true if there is a clear element that grabs attention first, false if the eye wanders aimlessly.\n'
         f'"focal_point": (1 sentence) What draws the eye first. If none, say "No clear anchor element".\n'
         f'"hierarchy_score": Integer from 1 to 10 (1 = completely flat/monotonous, 10 = extremely dynamic contrast in size/weight).\n'
@@ -184,7 +266,10 @@ def generate_critique(metrics, vlm_data, api_key):
         f"OpenCV Metrics: Balance Status: {metrics['balance']}. Text Density: {metrics['text_area']}%. Peak Saturation: {metrics['vibrancy']}%. Color Harmony: {metrics['harmony']}."
     )
     try:
-        return client.chat_completion(messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_data}], max_tokens=800, temperature=0.4).choices[0].message.content
+        return client.chat_completion(
+            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_data}],
+            max_tokens=800, temperature=0.4
+        ).choices[0].message.content
     except Exception as e:
         return f"MAIN_REC: API Error occurred.\n\n{str(e)}"
 
@@ -207,7 +292,10 @@ if uploaded_file is not None and hf_key and gemini_key:
         vlm_data = get_vlm_insights(image, gemini_key, dominant_hex, harmony)
     
     with st.spinner("Qwen drafting final critique..."):
-        raw_advice = generate_critique({"balance": balance_str, "text_area": text_area, "vibrancy": vibrancy, "harmony": harmony}, vlm_data, hf_key)
+        raw_advice = generate_critique(
+            {"balance": balance_str, "text_area": text_area, "vibrancy": vibrancy, "harmony": harmony},
+            vlm_data, hf_key
+        )
         
         main_rec = "Improve overall composition."
         detailed_advice = raw_advice
@@ -225,10 +313,19 @@ if uploaded_file is not None and hf_key and gemini_key:
         
     with col_data:
         # 1. Main Recommendation
-        st.markdown(f'<div class="metric-card" style="border: 1px solid #4facfe; background-color: #0b1a26;"><div class="metric-title" style="color: #4facfe;">💡 Top Recommendation</div><div style="font-size: 16px; font-weight: bold; color: white;">{main_rec}</div></div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="metric-card" style="border: 1px solid #4facfe; background-color: #0b1a26;">'
+            f'<div class="metric-title" style="color: #4facfe;">💡 Top Recommendation</div>'
+            f'<div style="font-size: 16px; font-weight: bold; color: white;">{main_rec}</div></div>',
+            unsafe_allow_html=True
+        )
         
         # 2. Aesthetic
-        st.markdown(f'<div class="metric-card"><div class="metric-title">Detected Aesthetic</div><div class="metric-value" style="color: #4facfe;">{vlm_data.get("aesthetic", "Unknown")}</div></div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="metric-card"><div class="metric-title">Detected Aesthetic</div>'
+            f'<div class="metric-value" style="color: #4facfe;">{vlm_data.get("aesthetic", "Unknown")}</div></div>',
+            unsafe_allow_html=True
+        )
         
         # 3. Focal Point Status Block
         has_anchor = vlm_data.get("has_focal_point", True)
@@ -236,13 +333,25 @@ if uploaded_file is not None and hf_key and gemini_key:
         anchor_color = "#4facfe" if has_anchor else "#ff4b4b"
         anchor_title = "Clear Anchor Detected" if has_anchor else "Missing Focal Point"
         anchor_text = vlm_data.get("focal_point", "None")
-        st.markdown(f'<div class="metric-card" style="border-left: 4px solid {anchor_color};"><div class="metric-title">{anchor_icon} {anchor_title}</div><div style="font-size: 14px; color: #DDD;">{anchor_text}</div></div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="metric-card" style="border-left: 4px solid {anchor_color};">'
+            f'<div class="metric-title">{anchor_icon} {anchor_title}</div>'
+            f'<div style="font-size: 14px; color: #DDD;">{anchor_text}</div></div>',
+            unsafe_allow_html=True
+        )
         
         # 4. Visual Hierarchy Gauge
         h_score = vlm_data.get("hierarchy_score", 5)
         h_color = "#ff4b4b" if h_score <= 4 else ("#faca2b" if h_score <= 7 else "#4facfe")
         h_label = "Flat / Monotonous" if h_score <= 4 else ("Moderate Variety" if h_score <= 7 else "Dynamic / Strong")
-        st.markdown(f'<div class="metric-card"><div class="metric-title">Visual Hierarchy Gauge</div><div class="metric-value" style="color: {h_color};">{h_label} ({h_score}/10)</div><div style="width: 100%; background-color: #333; border-radius: 5px; height: 8px; margin-top: 8px;"><div style="width: {h_score * 10}%; background-color: {h_color}; height: 8px; border-radius: 5px;"></div></div></div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="metric-card"><div class="metric-title">Visual Hierarchy Gauge</div>'
+            f'<div class="metric-value" style="color: {h_color};">{h_label} ({h_score}/10)</div>'
+            f'<div style="width: 100%; background-color: #333; border-radius: 5px; height: 8px; margin-top: 8px;">'
+            f'<div style="width: {h_score * 10}%; background-color: {h_color}; height: 8px; border-radius: 5px;"></div>'
+            f'</div></div>',
+            unsafe_allow_html=True
+        )
 
         # 5. Clutter Alert / Text Density
         is_cluttered = text_area > 25 and h_score <= 5
@@ -251,28 +360,73 @@ if uploaded_file is not None and hf_key and gemini_key:
         d_title_icon = "⚠️ CLUTTER ALERT" if is_cluttered else "TEXT DENSITY"
         d_label = "Overcrowded / Lacks Breathing Room" if is_cluttered else ("Heavy / Editorial" if text_area > 30 else "Balanced / Spacious")
         d_bar_color = "#ff4b4b" if is_cluttered else "#4facfe"
-        st.markdown(f'<div class="metric-card" style="{d_border}"><div class="metric-title" style="color: {d_title_color};">{d_title_icon}</div><div class="metric-value">{d_label} ({text_area}%)</div><div style="width: 100%; background-color: #333; border-radius: 5px; height: 8px; margin-top: 8px;"><div style="width: {min(text_area, 100)}%; background-color: {d_bar_color}; height: 8px; border-radius: 5px;"></div></div></div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="metric-card" style="{d_border}"><div class="metric-title" style="color: {d_title_color};">{d_title_icon}</div>'
+            f'<div class="metric-value">{d_label} ({text_area}%)</div>'
+            f'<div style="width: 100%; background-color: #333; border-radius: 5px; height: 8px; margin-top: 8px;">'
+            f'<div style="width: {min(text_area, 100)}%; background-color: {d_bar_color}; height: 8px; border-radius: 5px;"></div>'
+            f'</div></div>',
+            unsafe_allow_html=True
+        )
 
-        # 6. Composition & Typography
-        bal_color = "#4facfe" if "Perfectly" in balance_str else "#ff4b4b"
-        st.markdown(f'<div class="metric-card"><div class="metric-title">Composition Status</div><div class="metric-value" style="color: {bal_color};">{balance_str}</div></div>', unsafe_allow_html=True)
-        
+        # 6. Composition Status
+        is_balanced = balance_str == "Perfectly Balanced"
+        bal_color = "#4facfe" if is_balanced else "#ff4b4b"
+        bal_icon  = "✅" if is_balanced else "⚠️"
+        bal_html  = balance_str.replace("\n", "<br>")
+        st.markdown(
+            f'<div class="metric-card" style="border-left: 4px solid {bal_color};">'
+            f'<div class="metric-title">Composition Status</div>'
+            f'<div class="metric-value" style="color: {bal_color}; font-size: 13px; line-height: 1.8;">'
+            f'{bal_icon} {bal_html}</div></div>',
+            unsafe_allow_html=True
+        )
+
+        # 7. Typography Assessment
         font_str = vlm_data.get("font_suitability", "Unknown")
         font_color = "#4facfe" if "Good" in font_str else "#faca2b"
-        st.markdown(f'<div class="metric-card"><div class="metric-title">Typography Assessment</div><div class="metric-value" style="color: {font_color};">{font_str}</div></div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="metric-card"><div class="metric-title">Typography Assessment</div>'
+            f'<div class="metric-value" style="color: {font_color};">{font_str}</div></div>',
+            unsafe_allow_html=True
+        )
 
     with col_color:
+        # Visual Temperature
         temp_label = "Warm Toned" if temp > 55 else ("Cool Toned" if temp < 45 else "Neutral Toned")
-        st.markdown(f'<div class="metric-card"><div class="metric-title">Visual Temperature</div><div class="metric-value">{temp_label}</div><div style="width: 100%; height: 12px; border-radius: 6px; background: linear-gradient(to right, #2b5876 0%, #4e4376 30%, #b06ab3 50%, #f77062 80%, #fe5196 100%); position: relative; margin-top: 15px;"><div style="position: absolute; left: calc({temp}% - 7px); top: -10px; color: white; font-size: 16px;">▼</div></div></div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="metric-card"><div class="metric-title">Visual Temperature</div>'
+            f'<div class="metric-value">{temp_label}</div>'
+            f'<div style="width: 100%; height: 12px; border-radius: 6px; background: linear-gradient(to right, #2b5876 0%, #4e4376 30%, #b06ab3 50%, #f77062 80%, #fe5196 100%); position: relative; margin-top: 15px;">'
+            f'<div style="position: absolute; left: calc({temp}% - 7px); top: -10px; color: white; font-size: 16px;">▼</div>'
+            f'</div></div>',
+            unsafe_allow_html=True
+        )
 
         if bg_color:
-            st.markdown(f'<div class="metric-card"><div class="metric-title">Dominant Background ({bg_color["percentage"]}%)</div><div style="width: 100%; height: 20px; background-color: {bg_color["hex"]}; border-radius: 5px; border: 1px solid #555;"></div></div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="metric-card"><div class="metric-title">Dominant Background ({bg_color["percentage"]}%)</div>'
+                f'<div style="width: 100%; height: 20px; background-color: {bg_color["hex"]}; border-radius: 5px; border: 1px solid #555;"></div></div>',
+                unsafe_allow_html=True
+            )
         
-        bar_html = "".join([f'<div style="width: {c.get("rel_percentage", c["percentage"])}%; background-color: {c["hex"]};"></div>' for c in palette])
-        labels_html = "<br>".join([f'<span style="color:{c["hex"]};">● {c["hex"]} ({c.get("rel_percentage", c["percentage"])}%)</span>' for c in palette])
-        st.markdown(f'<div class="metric-card"><div class="metric-title">Foreground Palette ({harmony})</div><div style="width: 100%; height: 18px; display: flex; border-radius: 9px; overflow: hidden; margin-bottom: 10px; border: 1px solid #444;">{bar_html}</div><div style="font-size: 12px; color: #CCC;">{labels_html}</div></div>', unsafe_allow_html=True)
+        # Foreground Palette Bar
+        bar_html = "".join([
+            f'<div style="width: {c.get("rel_percentage", c["percentage"])}%; background-color: {c["hex"]};"></div>'
+            for c in palette
+        ])
+        labels_html = "<br>".join([
+            f'<span style="color:{c["hex"]};">● {c["hex"]} ({c.get("rel_percentage", c["percentage"])}%)</span>'
+            for c in palette
+        ])
+        st.markdown(
+            f'<div class="metric-card"><div class="metric-title">Foreground Palette ({harmony})</div>'
+            f'<div style="width: 100%; height: 18px; display: flex; border-radius: 9px; overflow: hidden; margin-bottom: 10px; border: 1px solid #444;">{bar_html}</div>'
+            f'<div style="font-size: 12px; color: #CCC;">{labels_html}</div></div>',
+            unsafe_allow_html=True
+        )
         
-        # Color Wheel is now ABOVE the Suggested Palette
+        # Color Wheel
         wheel_palette = core_colors if len(core_colors) > 0 else palette
         wheel_dots = ""
         for c in wheel_palette:
@@ -280,15 +434,26 @@ if uploaded_file is not None and hf_key and gemini_key:
                 rad = math.radians(c['hue'] - 90)
                 x, y = 50 + 35 * math.cos(rad), 50 + 35 * math.sin(rad)
                 wheel_dots += f'<div class="color-dot" style="left: {x}%; top: {y}%; background-color: {c["hex"]};"></div>'
-        st.markdown(f'<div class="metric-card"><div class="metric-title">Color Wheel Placement</div><div class="wheel-container"><div class="wheel-inner"></div>{wheel_dots}</div></div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="metric-card"><div class="metric-title">Color Wheel Placement</div>'
+            f'<div class="wheel-container"><div class="wheel-inner"></div>{wheel_dots}</div></div>',
+            unsafe_allow_html=True
+        )
 
-        # Suggested Palette pulling from Gemini
+        # Suggested Palette from Gemini
         rec_hexes = vlm_data.get("recommended_palette", [dominant_hex, "#333333", "#555555", "#777777", "#999999"])
         if not isinstance(rec_hexes, list) or len(rec_hexes) != 5:
             rec_hexes = [dominant_hex, "#333333", "#555555", "#777777", "#999999"]
             
-        rec_html = "".join([f'<div style="flex: 1; height: 25px; background-color: {hx}; margin-right: 5px; border-radius: 4px; border: 1px solid #555;"></div>' for hx in rec_hexes])
-        st.markdown(f'<div class="metric-card"><div class="metric-title">Suggested True Palette</div><div style="display: flex; width: 100%;">{rec_html}</div></div>', unsafe_allow_html=True)
+        rec_html = "".join([
+            f'<div style="flex: 1; height: 25px; background-color: {hx}; margin-right: 5px; border-radius: 4px; border: 1px solid #555;"></div>'
+            for hx in rec_hexes
+        ])
+        st.markdown(
+            f'<div class="metric-card"><div class="metric-title">Suggested True Palette</div>'
+            f'<div style="display: flex; width: 100%;">{rec_html}</div></div>',
+            unsafe_allow_html=True
+        )
 
     # --- Advice Section ---
     st.subheader("Art Director Breakdown")
