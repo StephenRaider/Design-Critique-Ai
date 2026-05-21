@@ -277,7 +277,7 @@ def analyze_balance_and_metrics(image):
     if not color_ok:
         problem_parts.append("Color Weight: " + ", ".join(color_issues))
 
-    balance_str = "\n".join(problem_parts) if problem_parts else "Perfectly Balanced"
+    balance_str = "\n".join(problem_parts) if problem_parts else "Balanced"
 
     text_mask = np.zeros((img_h, img_w), dtype=np.uint8)
     kernel    = cv2.getStructuringElement(cv2.MORPH_RECT, (18, 5))
@@ -318,13 +318,16 @@ def get_vlm_insights(opencv_image, api_key, palette, harmony_type):
         f'"aesthetic": 3-5 word summary of the overall visual style.\n'
         f'"detected_font": Brief description of the font style used (e.g. Bold Condensed Sans-Serif).\n'
         f'"font_suitability": You are a demanding art director. Only say "Good choice" if the font '
-        f'is genuinely exceptional and perfectly matched to the aesthetic. Otherwise identify a specific '
+        f'is genuinely exceptional and excellently matched to the aesthetic. Otherwise identify a specific '
         f'weakness (wrong mood, legibility issue, style clash) and respond with '
         f'"Recommend: [specific better font type + reason in max 8 words]". '
         f'Default toward recommending an improvement.\n'
         f'"has_focal_point": true if there is a clear element that grabs attention first, false otherwise.\n'
         f'"focal_point": 1 sentence. What draws the eye first. If none, say "No clear anchor element".\n'
         f'"hierarchy_score": Integer 1-10 (1=flat/monotonous, 10=dynamic size/weight contrast).\n'
+        f'"top_visual_mistake": 1 short actionable sentence addressing the absolute most glaring visual, layout, or stylistic flaw you see (e.g. "Reduce the harsh drop shadow on the main title", "Align the scattered text blocks to a single grid"). Be highly specific to the image flaws.\n'
+        f'"is_amateur_or_ai": true if the design looks amateurish, inexperienced, or has obvious AI-generated text/layout artifacts, false if it looks reasonably professional.\n'
+        f'"amateur_critique": If is_amateur_or_ai is true, provide 1 hard, direct sentence explaining exactly why it looks amateur or AI-generated. If false, output null.\n'
         f'"palette_verdict": Critically judge the current palette [{hex_list}] which follows a '
         f'{harmony_type} scheme. Is it working well for this aesthetic and design? '
         f'Reply with exactly one of: "Good Palette" OR a single sentence critique starting with '
@@ -353,6 +356,9 @@ def get_vlm_insights(opencv_image, api_key, palette, harmony_type):
             "has_focal_point": False,
             "focal_point": f"VLM call failed: {e}",
             "hierarchy_score": 5,
+            "top_visual_mistake": "Improve overall composition.",
+            "is_amateur_or_ai": False,
+            "amateur_critique": None,
             "palette_verdict": "Good Palette",
             "suggested_palette": None,
         }
@@ -368,11 +374,13 @@ def generate_critique(metrics, vlm_data, api_key):
         "You are an Art Director critiquing a poster. "
         "CRITICAL INSTRUCTION: You MUST start your response with the exact text 'MAIN_REC: ' "
         "followed by a single, SHORT, ACTIONABLE sentence stating the top recommendation to improve the design. "
+        "Base this MAIN_REC directly on the 'Top Visual Mistake' provided in the context to make it highly specific to this poster. "
         "After that sentence, leave a double line break, then output 3 highly detailed, actionable paragraphs "
         "explaining WHY the design needs improvement mathematically/visually and EXACTLY HOW to fix it."
     )
     user_data = (
         f"VLM Context: Aesthetic: {vlm_data.get('aesthetic')}. "
+        f"Top Visual Mistake: {vlm_data.get('top_visual_mistake')}. "
         f"Has Focal Point: {vlm_data.get('has_focal_point')}. "
         f"Hierarchy Score: {vlm_data.get('hierarchy_score')}/10. "
         f"Palette Verdict: {vlm_data.get('palette_verdict')}.\n"
@@ -491,7 +499,7 @@ if uploaded_file is not None and hf_key and gemini_key:
 
     # ── Middle column: metrics ────────────────────────────────────────────────
     with col_data:
-        # 1. Top Recommendation
+        # 1. Top Recommendation (Poster-Specific via VLM Top Mistake)
         st.markdown(
             f'<div class="metric-card" style="border: 1px solid #4facfe; background-color: #0b1a26;">'
             f'<div class="metric-title" style="color: #4facfe;">💡 Top Recommendation</div>'
@@ -550,7 +558,7 @@ if uploaded_file is not None and hf_key and gemini_key:
         )
 
         # 6. Composition Status
-        is_balanced = balance_str == "Perfectly Balanced"
+        is_balanced = balance_str == "Balanced"
         bal_color   = "#4facfe" if is_balanced else "#ff4b4b"
         bal_icon    = "✅" if is_balanced else "⚠️"
         bal_html    = balance_str.replace("\n", "<br>")
@@ -570,6 +578,17 @@ if uploaded_file is not None and hf_key and gemini_key:
             f'<div class="metric-value" style="color:{font_color};">{font_str}</div></div>',
             unsafe_allow_html=True,
         )
+
+        # 8. Dynamic Hard Critique Block (Only shows if amateur or AI-generated)
+        is_amateur = vlm_data.get("is_amateur_or_ai", False)
+        amateur_critique = vlm_data.get("amateur_critique")
+        if is_amateur and amateur_critique:
+            st.markdown(
+                f'<div class="metric-card" style="border: 1px solid #ff4b4b; background-color: #1a0808;">'
+                f'<div class="metric-title" style="color: #ff4b4b;">🛑 Hard Critique (Amateur / AI Detected)</div>'
+                f'<div style="font-size: 14px; font-weight: 500; color: #ffcccc; line-height: 1.5;">{amateur_critique}</div></div>',
+                unsafe_allow_html=True,
+            )
 
     # ── Right column: colour analysis ─────────────────────────────────────────
     with col_color:
