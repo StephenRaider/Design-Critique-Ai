@@ -262,6 +262,7 @@ def process_colors(image, k=5):
 
 
 def analyze_balance_and_metrics(image):
+    # Standard grayscale for balance checking
     gray     = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_OTSU | cv2.THRESH_BINARY_INV)
     hsv       = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
@@ -279,9 +280,14 @@ def analyze_balance_and_metrics(image):
 
     balance_str = "\n".join(problem_parts) if problem_parts else "Balanced"
 
+    # LAB Color Space for Robust Text Extraction
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l_channel, _, _ = cv2.split(lab)
+    _, text_thresh = cv2.threshold(l_channel, 0, 255, cv2.THRESH_OTSU | cv2.THRESH_BINARY_INV)
+    
     text_mask = np.zeros((img_h, img_w), dtype=np.uint8)
     kernel    = cv2.getStructuringElement(cv2.MORPH_RECT, (18, 5))
-    dilated   = cv2.dilate(thresh, kernel)
+    dilated   = cv2.dilate(text_thresh, kernel)
     contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     annotated = image.copy()
@@ -292,13 +298,13 @@ def analyze_balance_and_metrics(image):
             cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 0, 255), 3)
             cv2.rectangle(text_mask, (x, y), (x + w, y + h), 255, -1)
 
-    text_area      = round((cv2.countNonZero(text_mask) / (img_h * img_w)) * 100, 1)
+    cv_text_area   = round((cv2.countNonZero(text_mask) / (img_h * img_w)) * 100, 1)
     vibrancy_score = round(np.percentile(s, 90) / 255.0 * 100, 1)
     mean_b = image[:, :, 0].mean()
     mean_r = image[:, :, 2].mean()
     temp_score = round((mean_r / (mean_r + mean_b + 1e-5)) * 100, 1)
 
-    return annotated, balance_str, text_area, vibrancy_score, temp_score
+    return annotated, balance_str, cv_text_area, vibrancy_score, temp_score
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -313,8 +319,9 @@ def get_vlm_insights(opencv_image, api_key, palette, harmony_type):
     hex_list = ", ".join([c["hex"] for c in palette[:5]])
 
     vlm_prompt = (
-        f"You are a senior art director. Analyze this poster and return ONLY a raw JSON object "
+        f"You are a senior art director. Analyze this image and return ONLY a raw JSON object "
         f"with these exact keys — no markdown, no backticks, no explanation:\n\n"
+        f'"is_valid_poster": true if the image is a graphic design, poster, flyer, layout, or typographic piece. false if it is a random photograph, selfie, or completely unrelated non-design image.\n'
         f'"aesthetic": 3-5 word summary of the overall visual style.\n'
         f'"detected_font": Brief description of the font style used (e.g. Bold Condensed Sans-Serif).\n'
         f'"font_suitability": You are a demanding art director. Only say "Good choice" if the font '
@@ -325,6 +332,7 @@ def get_vlm_insights(opencv_image, api_key, palette, harmony_type):
         f'"has_focal_point": true if there is a clear element that grabs attention first, false otherwise.\n'
         f'"focal_point": 1 sentence. What draws the eye first. If none, say "No clear anchor element".\n'
         f'"hierarchy_score": Integer 1-10 (1=flat/monotonous, 10=dynamic size/weight contrast).\n'
+        f'"estimated_text_density": Integer from 0 to 100 estimating the percentage of the canvas covered by text elements.\n'
         f'"top_visual_mistake": 1 short actionable sentence addressing the absolute most glaring visual, layout, or stylistic flaw you see (e.g. "Reduce the harsh drop shadow on the main title", "Align the scattered text blocks to a single grid"). Be highly specific to the image flaws.\n'
         f'"is_amateur_or_ai": true if the design looks amateurish, inexperienced, or has obvious AI-generated text/layout artifacts, false if it looks reasonably professional.\n'
         f'"amateur_critique": If is_amateur_or_ai is true, provide 1 hard, direct sentence explaining exactly why it looks amateur or AI-generated. If false, output null.\n'
@@ -350,12 +358,14 @@ def get_vlm_insights(opencv_image, api_key, palette, harmony_type):
         return json.loads(raw)
     except Exception as e:
         return {
+            "is_valid_poster": True,
             "aesthetic": "Analysis Error",
             "detected_font": "Unknown",
             "font_suitability": "Error",
             "has_focal_point": False,
             "focal_point": f"VLM call failed: {e}",
             "hierarchy_score": 5,
+            "estimated_text_density": 15,
             "top_visual_mistake": "Improve overall composition.",
             "is_amateur_or_ai": False,
             "amateur_critique": None,
@@ -470,15 +480,27 @@ if uploaded_file is not None and hf_key and gemini_key:
 
     with st.spinner("Analysing mass, colours, and distribution…"):
         bg_color, palette, harmony, core_colors = process_colors(image)
-        annotated_img, balance_str, text_area, vibrancy, temp = analyze_balance_and_metrics(image)
+        annotated_img, balance_str, cv_text_area, vibrancy, temp = analyze_balance_and_metrics(image)
         dominant_hex = palette[0]["hex"] if palette else "#FFFFFF"
 
-    with st.spinner("VLM assessing hierarchy, focal points, typography, and palette…"):
+    with st.spinner("VLM assessing hierarchy, focal points, typography, and validation…"):
         vlm_data = get_vlm_insights(image, gemini_key, palette, harmony)
+
+    # Validation Safety Gate
+    if not vlm_data.get("is_valid_poster", True):
+        st.error("🚨 **Invalid Submission Detected**\nPlease submit a valid poster, flyer, or graphic design layout. This app is strictly designed for design critique and cannot analyze random photographs or unrelated images.")
+        st.stop()
+
+    # Consensus Mechanism for Text Density (Delta = 15%)
+    vlm_density = vlm_data.get("estimated_text_density", cv_text_area)
+    if abs(cv_text_area - vlm_density) > 15:
+        final_text_density = vlm_density # Fallback to AI if math fails on complex background
+    else:
+        final_text_density = cv_text_area
 
     with st.spinner("Qwen drafting the final critique…"):
         raw_advice = generate_critique(
-            {"balance": balance_str, "text_area": text_area,
+            {"balance": balance_str, "text_area": final_text_density,
              "vibrancy": vibrancy, "harmony": harmony},
             vlm_data, hf_key,
         )
@@ -540,19 +562,19 @@ if uploaded_file is not None and hf_key and gemini_key:
         )
 
         # 5. Text Density / Clutter Alert
-        is_cluttered = text_area > 25 and h_score <= 5
+        is_cluttered = final_text_density > 25 and h_score <= 5
         d_border    = "border:1px solid #ff4b4b;background:#2b1111;" if is_cluttered else ""
         d_t_color   = "#ff4b4b" if is_cluttered else "#AAAAAA"
         d_icon      = "⚠️ CLUTTER ALERT" if is_cluttered else "TEXT DENSITY"
         d_label     = ("Overcrowded / Lacks Breathing Room" if is_cluttered
-                       else ("Heavy / Editorial" if text_area > 30 else "Balanced / Spacious"))
+                       else ("Heavy / Editorial" if final_text_density > 30 else "Balanced / Spacious"))
         d_bar_color = "#ff4b4b" if is_cluttered else "#4facfe"
         st.markdown(
             f'<div class="metric-card" style="{d_border}">'
             f'<div class="metric-title" style="color:{d_t_color};">{d_icon}</div>'
-            f'<div class="metric-value">{d_label} ({text_area}%)</div>'
+            f'<div class="metric-value">{d_label} ({final_text_density}%)</div>'
             f'<div style="width:100%;background:#333;border-radius:5px;height:8px;margin-top:8px;">'
-            f'<div style="width:{min(text_area,100)}%;background:{d_bar_color};height:8px;border-radius:5px;"></div>'
+            f'<div style="width:{min(final_text_density,100)}%;background:{d_bar_color};height:8px;border-radius:5px;"></div>'
             f'</div></div>',
             unsafe_allow_html=True,
         )
